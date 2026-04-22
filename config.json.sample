@@ -1,0 +1,22 @@
+{
+  "host": {
+    "host": "192.168.1.100",
+    "port": 22,
+    "username": "admin",
+    "passwd": null,
+    "keyfile": "~/.ssh/id_rsa",
+    "timeout": 10,
+    "verify_host_key": false
+  },
+  "services": [
+    "bmcweb.service",
+    "xyz.openbmc_project.Logging.service"
+  ],
+  "sampling": {
+    "range_mins": 1,
+    "interval_secs": 5
+  },
+  "output": {
+    "csv_file": "results/monitor_results.csv"
+  }
+}

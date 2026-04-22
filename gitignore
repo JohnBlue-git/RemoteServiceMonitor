@@ -1,0 +1,12 @@
+# credentials — never commit real config with passwords
+config.local.json
+
+# output
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
