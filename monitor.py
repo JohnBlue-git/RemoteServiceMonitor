@@ -296,86 +296,197 @@ class ServiceSummary:
 
 
 # ---------------------------------------------------------------------------
+# Service stat query — helpers
+# ---------------------------------------------------------------------------
+
+def _build_query_cmd(service: str) -> str:
+    """
+    Build a single shell command that:
+      1. Discovers all PIDs in *service*'s cgroup
+         (tries cgroup v2, then cgroup v1 systemd hierarchy, then MainPID).
+      2. Reads /proc/<pid>/stat and VmRSS for every discovered PID.
+      3. Reads /proc/uptime and /proc/meminfo once (shared across all PIDs).
+
+    Sentinel lines (__STAT_<pid>__, __RSS_<pid>__, __UPTIME__, __MEMTOTAL__)
+    delimit each section for unambiguous parsing by _parse_query_output().
+    """
+    return (
+        # Resolve the cgroup path for this service
+        f'CGROUP=$(systemctl show --property=ControlGroup {service} 2>/dev/null'
+        " | grep '^ControlGroup=' | cut -d= -f2 | tr -d '[:space:]'); "
+        '[ -z "$CGROUP" ] && exit 0; '
+        # Read cgroup.procs: try cgroup v2, then cgroup v1 (systemd hierarchy)
+        'PIDS=$(cat /sys/fs/cgroup"$CGROUP"/cgroup.procs 2>/dev/null'
+        '    || cat /sys/fs/cgroup/systemd"$CGROUP"/cgroup.procs 2>/dev/null); '
+        # Fall back to MainPID when cgroup.procs is unavailable
+        'if [ -z "$PIDS" ]; then '
+        f'  M=$(systemctl show --property=MainPID {service} 2>/dev/null'
+        "  | grep '^MainPID=' | cut -d= -f2 | tr -d '[:space:]'); "
+        '  [ -n "$M" ] && [ "$M" != "0" ] && PIDS=$M; '
+        'fi; '
+        '[ -z "$PIDS" ] && exit 0; '
+        # Per-PID /proc data — unique sentinel per PID so the parser can match them
+        'for P in $PIDS; do '
+        '  echo "__STAT_${P}__"; cat /proc/$P/stat 2>/dev/null; '
+        '  echo "__RSS_${P}__"; grep VmRSS /proc/$P/status 2>/dev/null; '
+        'done; '
+        # System-wide data (read once, shared across all PIDs)
+        'echo __UPTIME__; cat /proc/uptime; '
+        'echo __MEMTOTAL__; grep MemTotal /proc/meminfo'
+    )
+
+
+def _parse_query_output(
+    raw: str,
+) -> tuple[dict[int, dict[str, str]], float | None, int | None]:
+    """
+    Parse the sentinel-delimited output produced by _build_query_cmd().
+
+    Returns:
+        pid_data     — {pid: {'stat': <stat line>, 'rss_line': <VmRSS line>}}
+        uptime_sec   — float from /proc/uptime, or None on parse failure
+        mem_total_kb — int  from /proc/meminfo MemTotal, or None on parse failure
+    """
+    pid_data:     dict[int, dict[str, str]] = {}
+    uptime_sec:   float | None = None
+    mem_total_kb: int   | None = None
+
+    current_pid:   int  | None = None
+    current_field: str  | None = None  # 'stat' or 'rss_line'
+    current_key:   str  | None = None  # '__UPTIME__' or '__MEMTOTAL__'
+
+    for raw_line in raw.splitlines():
+        line = raw_line.rstrip()
+
+        # Per-PID STAT sentinel
+        m = re.match(r'^__STAT_(\d+)__$', line)
+        if m:
+            current_pid, current_field, current_key = int(m.group(1)), 'stat', None
+            pid_data.setdefault(current_pid, {})
+            continue
+
+        # Per-PID RSS sentinel
+        m = re.match(r'^__RSS_(\d+)__$', line)
+        if m:
+            current_pid, current_field, current_key = int(m.group(1)), 'rss_line', None
+            pid_data.setdefault(current_pid, {})
+            continue
+
+        # System-wide sentinels
+        if line == '__UPTIME__':
+            current_key, current_pid, current_field = '__UPTIME__', None, None
+            continue
+        if line == '__MEMTOTAL__':
+            current_key, current_pid, current_field = '__MEMTOTAL__', None, None
+            continue
+
+        if not line:  # skip blank lines between sentinel and content
+            continue
+
+        # Capture the first non-empty content line after each sentinel
+        if current_pid is not None and current_field is not None:
+            if current_field not in pid_data[current_pid]:
+                pid_data[current_pid][current_field] = line
+            current_field = None
+        elif current_key == '__UPTIME__' and uptime_sec is None:
+            try:
+                uptime_sec = float(line.split()[0])
+            except (ValueError, IndexError):
+                pass
+            current_key = None
+        elif current_key == '__MEMTOTAL__' and mem_total_kb is None:
+            try:
+                mem_total_kb = int(line.split()[1])
+            except (ValueError, IndexError):
+                pass
+            current_key = None
+
+    return pid_data, uptime_sec, mem_total_kb
+
+
+def _parse_cpu_percent(stat_line: str, uptime_sec: float) -> float | None:
+    """
+    Compute lifetime-average CPU% from a /proc/<pid>/stat line and system uptime.
+
+    The comm field (field 2) may contain spaces and parentheses, so fields after
+    it are located via the last ')' in the line.
+    Fields used (0-indexed after comm+state): 11=utime, 12=stime, 19=starttime.
+    Returns None if parsing fails or the computed process age is non-positive.
+    """
+    try:
+        rp        = stat_line.rfind(")")
+        fields    = stat_line[rp + 2:].split()
+        utime     = int(fields[11])
+        stime     = int(fields[12])
+        starttime = int(fields[19])
+        age = uptime_sec - starttime / _CLK_TCK
+        if age <= 0:
+            return None
+        return round(((utime + stime) / _CLK_TCK) / age * 100.0, 2)
+    except (ValueError, IndexError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Service stat query
 # ---------------------------------------------------------------------------
 
 def query_service(ssh: paramiko.SSHClient, service: str) -> "ProcessSample | None":
     """
-    Return (pid_count, cpu_pct, mem_pct, rss_mb) for the main process of the
-    given systemd unit, read directly from /proc.
+    Return a ProcessSample aggregated over all PIDs in the service's cgroup.
 
     Why /proc instead of ps:
       - BusyBox ps (used on OpenBMC) has no column-selection support.
       - /proc/<pid>/stat and /proc/<pid>/status are always available.
 
-    CPU%  = (utime + stime) / CLK_TCK / process_age * 100  (lifetime average,
-             same metric that `ps %cpu` reports).
-    MEM%  = VmRSS / MemTotal * 100.
+    CPU%  = sum of per-PID (utime + stime) / CLK_TCK / process_age * 100
+            (lifetime average per process, summed across all cgroup PIDs).
+    MEM%  = total VmRSS across all PIDs / MemTotal * 100.
     """
-    cmd = (
-        # Get MainPID via KEY=VALUE (--value flag not available on old systemd)
-        f"M=$(systemctl show --property=MainPID {service} 2>/dev/null"
-        " | grep '^MainPID=' | cut -d= -f2 | tr -d '[:space:]'); "
-        '[ -z "$M" ] || [ "$M" = "0" ] && exit 0; '
-        # Read all needed /proc files in one command
-        'echo __STAT__; cat /proc/$M/stat 2>/dev/null; '
-        'echo __VMRSS__; grep VmRSS /proc/$M/status 2>/dev/null; '
-        'echo __UPTIME__; cat /proc/uptime 2>/dev/null; '
-        'echo __MEMTOTAL__; grep MemTotal /proc/meminfo 2>/dev/null'
-    )
+    cmd = _build_query_cmd(service)
     _, stdout, _ = ssh.exec_command(cmd)
-    output = stdout.read().decode(errors="replace").strip()
+    raw = stdout.read().decode(errors="replace")
 
-    if not output:
+    if not raw.strip():
         return None
 
-    try:
-        sections: dict[str, str] = {}
-        current: str | None = None
-        for line in output.splitlines():
-            if line in ("__STAT__", "__VMRSS__", "__UPTIME__", "__MEMTOTAL__"):
-                current = line
-            elif current is not None:
-                sections[current] = line
-                current = None
+    pid_data, uptime_sec, mem_total_kb = _parse_query_output(raw)
 
-        if not all(k in sections for k in ("__STAT__", "__VMRSS__", "__UPTIME__", "__MEMTOTAL__")):
-            return None
-
-        # VmRSS from /proc/<pid>/status  →  "VmRSS:   12345 kB"
-        rss_kb      = int(sections["__VMRSS__"].split()[1])
-
-        # MemTotal from /proc/meminfo  →  "MemTotal:   524288 kB"
-        mem_total_kb = int(sections["__MEMTOTAL__"].split()[1])
-        mem_pct      = round(rss_kb / mem_total_kb * 100.0, 2) if mem_total_kb else 0.0
-
-        # CPU% from /proc/<pid>/stat
-        # comm field may contain spaces and parentheses; find its end by the last ')'
-        stat_line = sections["__STAT__"]
-        rp        = stat_line.rfind(")")
-        fields    = stat_line[rp + 2:].split()
-        # After comm+state: index 11=utime, 12=stime, 19=starttime
-        utime     = int(fields[11])
-        stime     = int(fields[12])
-        starttime = int(fields[19])
-
-        uptime_sec  = float(sections["__UPTIME__"].split()[0])
-        process_age = uptime_sec - starttime / _CLK_TCK
-        if process_age <= 0:
-            return None
-
-        cpu_pct = round(((utime + stime) / _CLK_TCK) / process_age * 100.0, 2)
-
-        return ProcessSample(
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            pid_count=1,
-            cpu_percent=cpu_pct,
-            mem_percent=mem_pct,
-            rss_mb=round(rss_kb / 1024.0, 2),
-        )
-
-    except (ValueError, IndexError, KeyError, ZeroDivisionError):
+    if not pid_data or uptime_sec is None or mem_total_kb is None:
         return None
+
+    total_rss_kb  = 0
+    total_cpu_pct = 0.0
+    valid_pids    = 0
+
+    for entry in pid_data.values():
+        stat_line = entry.get('stat', '')
+        rss_line  = entry.get('rss_line', '')
+        if not stat_line or not rss_line:
+            continue
+        cpu_pct = _parse_cpu_percent(stat_line, uptime_sec)
+        if cpu_pct is None:
+            continue
+        try:
+            rss_kb = int(rss_line.split()[1])
+        except (ValueError, IndexError):
+            continue
+        total_rss_kb  += rss_kb
+        total_cpu_pct += cpu_pct
+        valid_pids    += 1
+
+    if valid_pids == 0:
+        return None
+
+    mem_pct = round(total_rss_kb / mem_total_kb * 100.0, 2) if mem_total_kb else 0.0
+
+    return ProcessSample(
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        pid_count=valid_pids,
+        cpu_percent=round(total_cpu_pct, 2),
+        mem_percent=mem_pct,
+        rss_mb=round(total_rss_kb / 1024.0, 2),
+    )
 
 
 # ---------------------------------------------------------------------------
