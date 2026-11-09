@@ -1,6 +1,6 @@
 {
   "host": {
-    "host": "192.168.9.227",
+    "host": "192.168.9.222",
     "port": 22,
     "username": "root",
     "passwd": "0penBmc",
@@ -17,6 +17,7 @@
     "interval_secs": 5
   },
   "output": {
-    "csv_file": null
+    "csv_file": "results/monitor_samples.csv",
+    "plot_file": "results/monitor_timeseries.png"
   }
 }

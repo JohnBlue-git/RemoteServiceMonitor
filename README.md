@@ -2,7 +2,8 @@
 
 Monitor CPU and memory usage of remote systemd services over SSH.  
 One SSH connection is opened per run, all services are sampled, then the connection is closed.  
-Results are printed as a summary table and optionally appended to a CSV file.
+Every measurement is printed and optionally appended to a CSV file. A time-series
+PNG plot is saved after each run.
 
 ---
 
@@ -10,6 +11,7 @@ Results are printed as a summary table and optionally appended to a CSV file.
 
 - Python 3.10+
 - [paramiko](https://www.paramiko.org/)
+- matplotlib
 
 ```bash
 pip install -r requirements.txt
@@ -49,7 +51,8 @@ python3 monitor.py my.json      # use a custom config file
     "interval_secs": 5
   },
   "output": {
-    "csv_file": "results/monitor_results.csv"
+    "csv_file": "results/monitor_samples.csv",
+    "plot_file": "results/monitor_timeseries.png"
   }
 }
 ```
@@ -90,7 +93,8 @@ The number of samples taken is `round(range_mins × 60 / interval_secs)`.
 
 | Field      | Type   | Description |
 |------------|--------|-------------|
-| `csv_file` | string | Path to append CSV results to. Set to `null` or `""` to disable CSV output. |
+| `csv_file` | string | Path to append every individual sample to. Set to `null` or `""` to disable CSV output. |
+| `plot_file` | string | Path for the generated CPU, memory, and RSS time-series PNG (default `results/monitor_timeseries.png`). |
 
 The directory is created automatically if it does not exist.
 
@@ -108,9 +112,9 @@ main()
   │     └── per service, per interval:
   │           query_service() → reads /proc/<MainPID>/stat + /proc/<MainPID>/status
   ├── close SSH connection    (once)
-  ├── ServiceSummary.compute()   → aggregate min/max/avg per service
-  ├── ServiceSummary.print_all() → print summary table
-  └── ServiceSummary.save_csv()  → append to CSV (if enabled)
+  ├── print_samples()            → print every timestamped measurement
+  ├── save_samples_csv()         → append every measurement (if enabled)
+  └── plot_samples()             → save CPU, memory, and RSS vs. time
 ```
 
 **Why `/proc` instead of `ps`?**  
@@ -119,9 +123,10 @@ Reading `/proc/<pid>/stat` and `/proc/<pid>/status` directly is always available
 
 **CPU% formula:**  
 `(utime + stime) / CLK_TCK / process_age × 100`  
-This is the lifetime-average CPU%, the same value `ps %cpu` reports.
+This is the process lifetime-average CPU%, as reported by `ps %cpu`. The chart
+plots each collected value as-is; it does not calculate a run-wide average.
 
-**Non-active services** are detected before sampling and skipped — their rows appear in the summary with `---` for all stats.
+**Non-active services** are detected before sampling and skipped.
 
 ---
 
@@ -144,35 +149,38 @@ Connected.
 
 Connection to 192.168.9.227 closed.
 
-========================================================================================================
-  REMOTE SERVICE MONITOR — SUMMARY   host=192.168.9.227   interval=5s   range=1min
-========================================================================================================
-  Service                     Status       N  PIDs CPU% min CPU% max CPU% avg MEM% min MEM% max MEM% avg RSS avg MB
---------------------------------------------------------------------------------------------------------
-  bmcweb.service              active      12   1.0     0.11     0.11     0.11     2.26     2.26     2.26      21.15
-  miniupnpd.service           inactive     0   ---      ---      ---      ---      ---      ---      ---        ---
-========================================================================================================
+REMOTE SERVICE MONITOR — SAMPLES   host=192.168.9.227
+  Timestamp           Service                            PIDs     CPU%     MEM%     RSS MB
+  2026-04-22 16:58:43 bmcweb.service                        1     0.11     2.26      21.15
+  ...
 
-Summary appended to: results/monitor_results.csv
+Samples appended to: results/monitor_samples.csv
+Time-series plot saved to: results/monitor_timeseries.png
 ```
+
+The plot contains separate CPU%, memory%, and RSS panels. Each service is a
+separate line, with one marker for each successful sample.
+
+Example plot from live measurements:
+
+![Time-series plot of CPU, memory, and RSS measurements](docs/monitor_timeseries.png)
 
 ---
 
 ## CSV Output
 
-Each run appends one row per service to the CSV file. A header is written automatically on first creation.
+Each run appends one row per successful sample to the CSV file. A header is written automatically on first creation.
 
 | Column          | Description |
 |-----------------|-------------|
-| `run_timestamp` | Wall-clock time when the run completed |
+| `timestamp` | Wall-clock time when this sample was collected |
 | `host`          | Host IP/name from config |
 | `service`       | Systemd unit name |
 | `svc_status`    | `active`, `inactive`, `failed`, etc. |
-| `samples`       | Number of successful samples collected |
-| `pid_avg`       | Average PID count across samples |
-| `cpu_min/max/avg` | CPU% statistics across samples |
-| `mem_min/max/avg` | Memory% (RSS / MemTotal) statistics |
-| `rss_min/max/avg_mb` | RSS (Resident Set Size) in megabytes statistics |
+| `pid_count`     | Number of processes included in this sample |
+| `cpu_percent`   | CPU% for this sample |
+| `mem_percent`   | Memory% (RSS / MemTotal) for this sample |
+| `rss_mb`        | RSS (Resident Set Size) in megabytes for this sample |
 
 ---
 
@@ -184,7 +192,7 @@ RemoteServiceMonitor/
 ├── config.json      # host / service / sampling configuration
 ├── requirements.txt
 ├── .gitignore
-└── results/         # CSV output directory (auto-created)
+└── results/         # CSV and plot output directory (auto-created)
 ```
 
 ---
@@ -197,3 +205,4 @@ RemoteServiceMonitor/
   python3 monitor.py config.local.json
   ```
 - Service names are validated against `^[\w:.@-]+\.service$` before being passed to any remote command.
+
